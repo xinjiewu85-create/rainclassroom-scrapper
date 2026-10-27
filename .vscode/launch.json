@@ -1,31 +1,13 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python Debugger: Current File with Arguments",
+            "name": "雨课堂：扫码后选择课程",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "program": "${workspaceFolder}/main.py",
             "console": "integratedTerminal",
-            "args": [
-                "-ds",
-                "-nv",
-                "-cnf",
-                "清华大学",
-                "-c",
-                "${input:cookie}" // Ask for cookie here
-            ]
-        }
-    ],
-    "inputs": [
-        {
-            "id": "cookie",
-            "type": "promptString",
-            "description": "Enter the cookie",
-            "default": "cookie"
+            "args": []
         }
     ]
 }

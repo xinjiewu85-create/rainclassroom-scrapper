@@ -1,313 +1,238 @@
+"""Download and join media using stream copy, without a shell or GPU."""
+
+import hashlib
+import json
 import os
 import re
-import subprocess
-import sys
-import time
-import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import shutil
+import subprocess
+from pathlib import Path
+from urllib.parse import urlsplit
 
-FFMPEG_PATH = "ffmpeg" if shutil.which("ffmpeg") else os.path.join(os.getcwd(), "ffmpeg")
-ARIA2C_PATH = "aria2c" if shutil.which("aria2c") else os.path.join(os.getcwd(), "aria2c")
-WINDOWS = sys.platform == 'win32'
+import certifi
 
-
-def download_segment(CACHE_FOLDER, url: str, order: int, name_prefix: str = "") -> subprocess.CompletedProcess:
-    print(f"Downloading {name_prefix} - {order}")
-
-    video_download_command = (f"{ARIA2C_PATH} -o '{CACHE_FOLDER}/{name_prefix}-{order}.mp4'"
-                              f" -x 16 -s 16 -k 1M '{url}' --stream-piece-selector random -k 1M -c -l aria2c_video.log --log-level warn")
-
-    if WINDOWS:
-        result = subprocess.run(['powershell', '-Command', video_download_command], text=True)
-    else:
-        result = subprocess.run(video_download_command, shell=True)
-
-    return result.returncode
+from common import DownloadError, complete, https_url
 
 
-def download_segment_idm(CACHE_FOLDER, url: str, order: int, name_prefix: str = ""):
-    print(f"Downloading {name_prefix} - {order}")
+def best_sources(sources):
+    if not isinstance(sources, dict) or not sources:
+        return []
 
-    name_prefix_idm = name_prefix.replace('/', '\\')
-
-    # Define the full path for the downloaded file
-    downloaded_file = os.path.join(CACHE_FOLDER, f"{name_prefix_idm}-{order}.mp4")
-    print("Downloading to", downloaded_file)
-
-    if os.path.exists(downloaded_file):
-        print(f"Skipping {downloaded_file} - Video already present")
-        time.sleep(0.25)
-        return downloaded_file
-
-    # Construct the IDM download command
-    video_download_command = (
-        f"idman /n /d \"{url}\" /p \"$(pwd)\" /f \"{downloaded_file}\""
-    )
-
-    # Start the IDM download process
-    subprocess.run(['powershell', '-Command', video_download_command], text=True)
-
-    # Wait for the file to appear and its download to complete
-    print(f"Waiting for {downloaded_file} to finish downloading...")
-    try:
-        # Wait until the file is created
-        while not os.path.exists(downloaded_file):
-            time.sleep(1)  # Wait until the file is created
-
-        # Wait until the file stops growing
-        prev_size = -1
-        while True:
-            curr_size = os.path.getsize(downloaded_file)
-            if curr_size == prev_size:
-                break  # File size hasn't changed, download likely complete
-            prev_size = curr_size
-            time.sleep(1)  # Check every second
-
-    except KeyboardInterrupt:
-        print("\nDownload interrupted by user.")
-        # Optionally, clean up the partially downloaded file
-        if os.path.exists(downloaded_file):
-            print(f"Removing incomplete file: {downloaded_file}")
-            os.remove(downloaded_file)
-        raise  # Re-raise the exception to propagate it
-
-    print(f"Download completed: {downloaded_file}")
-    return 0
-
-
-def download_segment_m3u8(idm_flag, CACHE_FOLDER, url: str, order: int, name_prefix: str = "", max_retries: int = 35):
-    print(f"Downloading {name_prefix} - {order}")
-    print(f"Downloading from {url}")
-
-    # Initial download attempt with 32 workers
-
-    # video_download_command = (f".\\ffmpeg -i '{url}' -c copy -n '{CACHE_FOLDER}/{name_prefix}-{order}.mp4'"
-    #                           f" -hide_banner -loglevel error -stats")
-
-    # video_download_command = (f".\\HLSDownloader -u '{url}' -o '{CACHE_FOLDER}/{name_prefix}-{order}.mp4'"
-    #                           f" -w 32 -workers 32 ")
-
-    # video_download_command = (f".\\m3u8dl-windows-amd64.exe -i '{url}' -o '{CACHE_FOLDER}/{name_prefix}-{order}.mp4'"
-    #                           f" -retry 1 -t '{CACHE_FOLDER}' -thread 32")
-
-    # video_download_command = (
-    #     f".\\vsd.exe save '{url}' -o '{CACHE_FOLDER}/{name_prefix}-{order}.mp4' "
-    #     f"-d {CACHE_FOLDER} --retry-count 15 -t 4")
-
-    output_path = f"{CACHE_FOLDER}/{name_prefix}-{order}"
-    save_dir = os.path.dirname(output_path)
-    save_name = os.path.basename(output_path)
-
-    if 'mp3' in url or not WINDOWS:
-        if idm_flag:
-            video_download_command = (
-                f"idman /n /d \"{url}\" /p \"$(pwd)\" /f '{CACHE_FOLDER}/{name_prefix}-{order}.mp4'"
-            )
-        else:
-            video_download_command = (
-                f"{FFMPEG_PATH} -i '{url}' -c:v copy -c:a copy -n '{CACHE_FOLDER}/{name_prefix}-{order}.mp4' "
-                f"-hide_banner -loglevel error -stats"
-            )
-
-    else:
-        video_download_command = (
-            f".\\N_m3u8DL-RE.exe '{url}' --tmp-dir './{CACHE_FOLDER}' "
-            f"--save-dir '{save_dir}' --save-name '{save_name}' -M format=mp4 "
-            f"--check-segments-count false --download-retry-count 15 --thread-count 64"
+    # Existing API uses quality10, quality20, etc. Also accept named qualities.
+    def quality(key):
+        numbers = re.findall(r"\d+", str(key))
+        return (
+            int(numbers[-1]) if numbers else {"sd": 1, "hd": 2, "fhd": 3, "uhd": 4}.get(str(key).lower(), 0)
         )
 
-    if WINDOWS:
-        result = subprocess.run(['powershell', '-Command', video_download_command], text=True)
-    else:
-        result = subprocess.run(video_download_command, shell=True)
-
-    return result.returncode
-
-
-def download_segments_in_parallel(idm_flag, fallback_flag, CACHE_FOLDER, lesson_video_data, name_prefix):
-    has_error = False
-
-    # MOOC TYPE
-    if fallback_flag == 2:
-        # Create a ThreadPoolExecutor to manage parallel downloads
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            # Dictionary to hold future results
-            future_to_order = {}
-
-            for order, url in enumerate(lesson_video_data):
-                if idm_flag:
-                    future = executor.submit(download_segment_idm, CACHE_FOLDER, url, order, name_prefix)
-                else:
-                    future = executor.submit(download_segment, CACHE_FOLDER, url, order, name_prefix)
-
-                # Store the future and order for tracking
-                future_to_order[future] = order
-
-                # Add a 1-second interval between submissions
-                time.sleep(1)
-
-            # Iterate over the completed futures
-            for future in as_completed(future_to_order):
-                order = future_to_order[future]
-                try:
-                    result = future.result()  # Get the result (will raise exception if there was one)
-                    if not idm_flag and result != 0:
-                        print(f"Failed to download {name_prefix} - {order}, downloader returned {result}", file=sys.stderr)
-                        has_error = True
-                    else:
-                        print(f"Successfully downloaded {name_prefix} - {order}")
-                except Exception:
-                    print(traceback.format_exc())
-                    print(f"Failed to download {name_prefix} - {order}", file=sys.stderr)
-                    has_error = True
-
-    # v1 type
-    elif fallback_flag == 1:
-        # Create a ThreadPoolExecutor to manage parallel downloads
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            # Dictionary to hold future results
-            future_to_order = {}
-
-            for order, segment in enumerate(lesson_video_data['data']['live_timeline']):
-                replay_url = segment['replay_url']
-
-                # Determine which function to use based on the presence of 'm3u8' in the replay_url
-                if 'm3u8' in replay_url:
-                    future = executor.submit(download_segment_m3u8, idm_flag, CACHE_FOLDER, replay_url, order,
-                                             name_prefix,
-                                             max_retries=10)
-                else:
-                    if idm_flag:
-                        future = executor.submit(download_segment_idm, CACHE_FOLDER, replay_url, order, name_prefix)
-                    else:
-                        future = executor.submit(download_segment, CACHE_FOLDER, replay_url, order, name_prefix)
-
-                # Store the future and order for tracking
-                future_to_order[future] = order
-
-                # Add a 1-second interval between submissions
-                time.sleep(1)
-
-            # Iterate over the completed futures
-            for future in as_completed(future_to_order):
-                order = future_to_order[future]
-                try:
-                    result = future.result()  # Get the result (will raise exception if there was one)
-                    if not idm_flag and result != 0:
-                        print(f"Failed to download {name_prefix} - {order}, downloader returned {result}", file=sys.stderr)
-                        has_error = True
-                    else:
-                        print(f"Successfully downloaded {name_prefix} - {order}")
-                except Exception:
-                    print(traceback.format_exc())
-                    print(f"Failed to download {name_prefix} - {order}", file=sys.stderr)
-                    has_error = True
-
-    # v3 type
-    else:
-        # Create a ThreadPoolExecutor to manage parallel downloads
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            # Dictionary to hold future results
-            future_to_order = {}
-
-            for order, segment in enumerate(lesson_video_data['data']['live']):
-                url = segment['url']
-
-                # Determine which function to use based on the presence of 'm3u8' in the URL
-                if 'm3u8' in url:
-                    future = executor.submit(download_segment_m3u8, idm_flag, CACHE_FOLDER, url, order, name_prefix,
-                                             max_retries=10)
-                else:
-                    if idm_flag:
-                        future = executor.submit(download_segment_idm, CACHE_FOLDER, url, order, name_prefix)
-                    else:
-                        future = executor.submit(download_segment, CACHE_FOLDER, url, order, name_prefix)
-
-                # Store the future and order for tracking
-                future_to_order[future] = order
-
-                # Add a 1-second interval between submissions
-                time.sleep(1)
-
-            # Iterate over the completed futures
-            for future in as_completed(future_to_order):
-                order = future_to_order[future]
-                try:
-                    result = future.result()  # Get the result (will raise exception if there was one)
-                    if not idm_flag and result != 0:
-                        print(f"Failed to download {name_prefix} - {order}, downloader returned {result}", file=sys.stderr)
-                        has_error = True
-                    else:
-                        print(f"Successfully downloaded {name_prefix} - {order}")
-                except Exception:
-                    print(traceback.format_exc())
-                    print(f"Failed to download {name_prefix} - {order}", file=sys.stderr)
-                    has_error = True
-
-    if has_error:
-        raise Exception("Failed to download some video segments.")
+    for key in sorted(sources, key=quality, reverse=True):
+        value = sources[key]
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            raise DownloadError("视频地址列表格式无法识别。")
+        urls = [https_url(item["url"] if isinstance(item, dict) else item) for item in value]
+        if urls:
+            return urls
+    return []
 
 
-def concatenate_segments(CACHE_FOLDER, DOWNLOAD_FOLDER, name_prefix, num_segments):
-    # Create the concat file with segment paths
-    with open(f"{CACHE_FOLDER}/concat.txt", "w", encoding='utf-8') as f:
-        for i in range(num_segments):
-            video_file_mp4 = f"../{CACHE_FOLDER}/{name_prefix}-{i}.mp4"
-            video_file_ts = f"../{CACHE_FOLDER}/{name_prefix}-{i}.ts"
-            if os.path.exists(os.path.join(CACHE_FOLDER, f"{name_prefix}-{i}.mp4")):  # Check if the file exists
-                f.write(f"file '{video_file_mp4}'\n")
-            if os.path.exists(os.path.join(CACHE_FOLDER, f"{name_prefix}-{i}.ts")):  # Check if the file exists
-                f.write(f"file '{video_file_ts}'\n")
-
-    target_file = os.path.join(DOWNLOAD_FOLDER, f"{name_prefix}.mp4")
-    if os.path.exists(target_file):
-        print(f"Skipping '{DOWNLOAD_FOLDER}/{name_prefix}.mp4' - Video already present")
-        time.sleep(0.25)
-        return target_file
-
-    # First video concatenation command using CUDA acceleration
-    video_concatenating_command = (
-        f"{FFMPEG_PATH} -f concat -safe 0 "
-        f"-i '{CACHE_FOLDER}/concat.txt' "
-        f"-c:v av1_nvenc -cq 36 -g 200 -bf 7 -b_strategy 1 -sc_threshold 80 -me_range 16  "
-        f"-surfaces 64 -bufsize 12800k -refs 16 -r 7.5 -temporal-aq 1 -rc-lookahead 127 "
-        f"-c:a aac -ac 1 -rematrix_maxval 1.0 -b:a 64k '{DOWNLOAD_FOLDER}/{name_prefix}.mp4' -n "
-        f"-hide_banner -loglevel error -stats"
-    )
-
-    # Run the first command
-    if WINDOWS:
-        result = subprocess.run(['powershell', '-Command', video_concatenating_command], text=True)
-    else:
-        result = subprocess.run(video_concatenating_command, shell=True)
-
-    # If the first command fails, try the fallback
-    if result.returncode != 0:
-        print(f"First attempt failed. Attempting fallback with software decoding.")
-
-        # Fallback video concatenation command using cuvid acceleration
-        video_concatenating_command_fallback = (
-            f"{FFMPEG_PATH} -f concat -safe 0 "
-            f"-i '{CACHE_FOLDER}/concat.txt' "
-            f"-c:v av1_nvenc -cq 36 -g 200 -bf 7 -b_strategy 1 -sc_threshold 80 -me_range 16 "
-            f"-surfaces 64 -bufsize 12800k -refs 16 -r 7.5 -temporal-aq 1 -rc-lookahead 127 "
-            f"-c:a copy '{DOWNLOAD_FOLDER}/{name_prefix}.mp4' -y "
-            f"-hide_banner -loglevel error -stats -err_detect ignore_err -fflags +discardcorrupt"
+def find_binary(name, folder=None):
+    suffix = ".exe" if os.name == "nt" else ""
+    # Only use the explicitly documented tools folder or PATH, not old bundled binaries.
+    location = Path(folder) if folder else Path(__file__).resolve().parent / "tools"
+    local = location / (name + suffix)
+    found = str(local.resolve()) if local.is_file() else shutil.which(name)
+    if not found:
+        raise DownloadError(
+            f"未找到 {name}。请将新版 FFmpeg 的 ffmpeg 和 ffprobe 放入 tools 文件夹或加入 PATH。"
         )
+    return found
 
-        # Run the fallback command
-        if WINDOWS:
-            fallback_result = subprocess.run(['powershell', '-Command', video_concatenating_command_fallback], text=True)
-        else:
-            fallback_result = subprocess.run(video_concatenating_command_fallback, shell=True)
 
-        # Check if the fallback also fails
-        if fallback_result.returncode != 0:
-            print(f"Both attempts failed to concatenate video segments.")
-        else:
-            print(f"Successfully concatenated video segments.")
-    else:
-        print(f"Successfully concatenated video segments using CUDA acceleration.")
+class VideoDownloader:
+    def __init__(self, files, cache, ffmpeg_dir=None):
+        self.files = files
+        self.cache = Path(cache).resolve()
+        self.ffmpeg = find_binary("ffmpeg", ffmpeg_dir)
+        self.ffprobe = find_binary("ffprobe", ffmpeg_dir)
 
-    return result
+    def run(self, args, *, cwd=None, timeout=12 * 60 * 60):
+        try:
+            result = subprocess.run(
+                args,
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+                shell=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            raise DownloadError("FFmpeg 无法运行或处理超时，请检查安装和网络后重试。") from None
+        if result.returncode:
+            # stderr can contain signed resource URLs. Do not print it.
+            raise DownloadError("FFmpeg 处理失败；已保留完整分段，可重试。")
+        return result.stdout
+
+    def probe(self, path):
+        output = self.run(
+            [
+                self.ffprobe,
+                "-v",
+                "error",
+                "-protocol_whitelist",
+                "file",
+                "-show_streams",
+                "-show_format",
+                "-of",
+                "json",
+                str(Path(path).resolve()),
+            ],
+            timeout=60,
+        )
+        try:
+            data = json.loads(output)
+            streams = [s for s in data["streams"] if s["codec_type"] in ("audio", "video")]
+            duration = float(data.get("format", {}).get("duration", 0))
+        except (ValueError, KeyError, TypeError):
+            raise DownloadError("视频结构无法识别。") from None
+        if not streams or duration <= 0:
+            raise DownloadError("视频为空或缺少有效的时长。")
+        return streams, duration
+
+    def valid(self, path):
+        if not complete(path):
+            return False
+        try:
+            self.probe(path)
+            return True
+        except DownloadError:
+            return False
+
+    def convert(self, input_args, target, *, cwd=None, expected_duration=None, tolerance=2):
+        target = Path(target)
+        temporary = target.with_name(target.stem + ".part" + target.suffix)
+        try:
+            self.run(
+                [
+                    self.ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-y",
+                    # Local concat may need harmless AAC priming timestamp corrections.
+                    # Remote HLS errors remain fatal to avoid saving incomplete streams.
+                    *(["-xerror"] if "concat" not in input_args else []),
+                    *input_args,
+                    "-map",
+                    "0:v?",
+                    "-map",
+                    "0:a?",
+                    "-c",
+                    "copy",
+                    str(temporary.resolve()),
+                ],
+                cwd=cwd,
+            )
+            _, duration = self.probe(temporary)
+            if expected_duration is not None and abs(duration - expected_duration) > tolerance:
+                raise DownloadError("合并后的时长与分段不一致，已保留分段。")
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def download(self, urls, target):
+        target = Path(target).resolve()
+        urls = [https_url(url) for url in urls]
+        if not urls:
+            print("  没有可访问的视频。")
+            return None
+        for extension in (".mp4", ".mkv"):
+            candidate = target.with_name(target.name + extension)
+            if self.valid(candidate):
+                print(f"  跳过已有视频：{candidate.name}")
+                return candidate
+        target.parent.mkdir(parents=True, exist_ok=True)
+        key = hashlib.sha256(str(target).encode()).hexdigest()[:20]
+        work = self.cache / key
+        work.mkdir(parents=True, exist_ok=True)
+        segments = []
+        for i, url in enumerate(urls):
+            # Query signatures change; they are neither cached nor logged.
+            resource = urlsplit(url)
+            identity = hashlib.sha256((resource.netloc + resource.path).encode()).hexdigest()[:10]
+            is_hls = resource.path.lower().endswith(".m3u8")
+            extension = ".mkv" if is_hls else ".media"
+            segment = work / f"{i:04d}-{identity}{extension}"
+            if not self.valid(segment):
+                print(f"  下载视频分段 {i + 1}/{len(urls)}")
+                if is_hls:
+                    self.convert(
+                        [
+                            "-protocol_whitelist",
+                            "https,tls,tcp,crypto",
+                            "-tls_verify",
+                            "1",
+                            "-ca_file",
+                            certifi.where(),
+                            "-rw_timeout",
+                            "60000000",
+                            "-i",
+                            url,
+                        ],
+                        segment,
+                    )
+                else:
+                    # Keep direct files byte-for-byte; an extra remux can quantize timestamps.
+                    self.files.download(url, segment, validator=self.probe)
+            segments.append(segment)
+        metadata = [self.probe(p) for p in segments]
+        fields = (
+            "codec_type",
+            "codec_name",
+            "codec_tag_string",
+            "width",
+            "height",
+            "pix_fmt",
+            "sample_rate",
+            "channels",
+            "channel_layout",
+            "time_base",
+            "r_frame_rate",
+            "profile",
+            "level",
+            "extradata_size",
+        )
+        signatures = [[tuple(s.get(k) for k in fields) for s in streams] for streams, _ in metadata]
+        if any(sig != signatures[0] for sig in signatures[1:]):
+            folder = target.with_name(target.name + "-原始分段")
+            folder.mkdir(exist_ok=True)
+            for i, segment in enumerate(segments, 1):
+                self.convert(["-protocol_whitelist", "file", "-i", str(segment)], folder / f"{i:04d}.mkv")
+            raise DownloadError("分段编码、分辨率或帧率不同，无法直接合并；原始分段已保存，可分别播放。")
+        # Safe generated basenames, relative to the manifest; no user title interpolation.
+        manifest = work / "concat.txt"
+        manifest.write_text("".join(f"file '{p.name}'\n" for p in segments), encoding="utf-8")
+        input_args = ["-protocol_whitelist", "file", "-f", "concat", "-safe", "1", "-i", str(manifest)]
+        expected_duration = sum(duration for _, duration in metadata)
+        for extension in (".mp4", ".mkv"):
+            candidate = target.with_name(target.name + extension)
+            try:
+                self.convert(
+                    input_args,
+                    candidate,
+                    cwd=work,
+                    expected_duration=expected_duration,
+                    tolerance=max(2, len(segments) * 0.2),
+                )
+                if extension == ".mkv":
+                    print("  原始编码不能写入 MP4，已无损保存为 MKV。")
+                shutil.rmtree(work)
+                print(f"  已保存视频：{candidate.name}")
+                return candidate
+            except DownloadError:
+                if extension == ".mkv":
+                    raise
+        return None

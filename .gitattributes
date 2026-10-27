@@ -1,0 +1,2 @@
+# Keep CRLF in the repository and ZIP downloads for cmd.exe.
+*.bat -text whitespace=cr-at-eol

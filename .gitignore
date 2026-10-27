@@ -1,6 +1,16 @@
 .idea/
+.venv/
 /data/
 /cache/
+/tools/*
+!/tools/README.md
 *.log
-__pycache__
+__pycache__/
+.ruff_cache/
+*.part
+session.txt
+session*.json
+cookies*.txt
+cookies*.json
 ffmpeg.exe
+ffprobe.exe

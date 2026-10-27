@@ -1,0 +1,2 @@
+# Optional: only for type-2 courseware printed through the official print page.
+selenium>=4.30,<5
